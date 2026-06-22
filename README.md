@@ -47,6 +47,40 @@ python main.py                          # Naive + Production + So sánh
 python check_lab.py                     # Kiểm tra trước khi nộp
 ```
 
+## 🖥️ Front-end / Demo Dashboard (`demo_app.py`)
+
+Ngoài pipeline CLI, dự án có thêm **giao diện web demo bằng Streamlit** để trực quan hóa
+và so sánh các phương pháp. Dashboard gồm **4 tab**:
+
+| Tab | Nội dung |
+|-----|----------|
+| 📊 **Điểm số RAGAS** | So sánh Naive vs Production (bar chart + bảng Δ + ngưỡng 0.75 + checklist bonus). Đọc trực tiếp từ `reports/*.json`. |
+| 🔎 **Tìm kiếm trực tiếp** | Nhập câu hỏi → so sánh 4 cột **BM25 / Dense / Hybrid (RRF) / +Rerank** cạnh nhau + biểu đồ latency từng bước. Truy vấn thẳng vào index Qdrant có sẵn (không re-embed). |
+| ✂️ **Chunking** | Chọn 1 tài liệu → chạy 4 chiến lược (basic/semantic/hierarchical/structure), biểu đồ số chunk + độ dài + preview từng chunk. |
+| 💰 **Chi phí & Latency** | Đếm token bằng tiktoken, ước tính chi phí API Naive vs Production (giá chỉnh được), so sánh combined-1-call vs 4-calls, và bảng latency breakdown. |
+
+### Cách chạy front-end
+
+```bash
+# 1. Cài thêm thư viện FE (1 lần)
+pip install streamlit plotly                      # hoặc: uv pip install streamlit plotly
+
+# 2. Đảm bảo đã có .env (GEMINI_API_KEY + QDRANT_URL/QDRANT_API_KEY)
+#    và đã chạy pipeline ít nhất 1 lần để có index Qdrant + reports/
+python naive_baseline.py
+python src/pipeline.py
+
+# 3. Khởi động dashboard
+streamlit run demo_app.py
+#   → mở http://localhost:8501
+```
+
+> **Lưu ý:**
+> - Tab "Điểm số" cần `reports/ragas_report.json` và `reports/naive_baseline_report.json`.
+> - Tab "Tìm kiếm" cần collection Qdrant đã được index (`lab18_production` hoặc `lab18_naive`);
+>   lần đầu mở mất ~10–20s để nạp index + dựng BM25 (sau đó được cache).
+> - Trên Windows nên đặt `PYTHONUTF8=1` để in tiếng Việt không lỗi encoding.
+
 ## Cấu trúc repo
 
 ```
