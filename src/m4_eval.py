@@ -6,7 +6,30 @@ import os, sys, json
 from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import TEST_SET_PATH
+from config import (TEST_SET_PATH, USE_GEMINI, GEMINI_BASE_URL, LLM_API_KEY,
+                    LLM_CHAT_MODEL, LLM_EMBED_MODEL, GEMINI_EMBED_DIM)
+
+
+def _build_ragas_judge():
+    """Trả về (llm, embeddings) cho RAGAS.
+
+    Dùng OpenAI-compatible endpoint của Gemini qua langchain_openai (ChatOpenAI +
+    OpenAIEmbeddings). Cách này ổn định với RAGAS hơn langchain-google-genai —
+    native google client KHÔNG nhận kwarg `temperature` mà RAGAS truyền xuống.
+    Trả (None, None) khi không có Gemini → RAGAS tự dùng OpenAI mặc định.
+    """
+    if not USE_GEMINI:
+        return None, None
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+    llm = ChatOpenAI(model=LLM_CHAT_MODEL, api_key=LLM_API_KEY,
+                     base_url=GEMINI_BASE_URL, temperature=0.0, timeout=120, max_retries=5)
+    embeddings = OpenAIEmbeddings(
+        model=LLM_EMBED_MODEL, api_key=LLM_API_KEY, base_url=GEMINI_BASE_URL,
+        dimensions=GEMINI_EMBED_DIM,
+        check_embedding_ctx_length=False,   # gửi text thô thay vì token-ids (Gemini compat)
+    )
+    return llm, embeddings
 
 
 @dataclass
@@ -29,51 +52,116 @@ def load_test_set(path: str = TEST_SET_PATH) -> list[dict]:
 
 def evaluate_ragas(questions: list[str], answers: list[str],
                    contexts: list[list[str]], ground_truths: list[str]) -> dict:
-    """Run RAGAS evaluation."""
-    # TODO: Implement RAGAS evaluation
-    # 1. Wrap trong try/except — RAGAS cần OPENAI_API_KEY và Python 3.11+.
-    # try:
-    #     from ragas import evaluate
-    #     from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
-    #     from datasets import Dataset
-    #
-    #     dataset = Dataset.from_dict({
-    #         "question": questions, "answer": answers,
-    #         "contexts": contexts, "ground_truth": ground_truths,
-    #     })
-    #     result = evaluate(dataset, metrics=[faithfulness, answer_relevancy,
-    #                                         context_precision, context_recall])
-    #     df = result.to_pandas()
-    #     per_question = [EvalResult(question=row["question"], answer=row["answer"],
-    #         contexts=row["contexts"], ground_truth=row["ground_truth"],
-    #         faithfulness=float(row.get("faithfulness", 0.0)),
-    #         answer_relevancy=float(row.get("answer_relevancy", 0.0)),
-    #         context_precision=float(row.get("context_precision", 0.0)),
-    #         context_recall=float(row.get("context_recall", 0.0)))
-    #         for _, row in df.iterrows()]
-    #     return {"faithfulness": ..., "answer_relevancy": ...,
-    #             "context_precision": ..., "context_recall": ..., "per_question": [...]}
-    # except Exception as e:
-    #     print(f"  ⚠️  RAGAS evaluation failed: {e}")
-    #     return zeros
-    return {"faithfulness": 0.0, "answer_relevancy": 0.0,
-            "context_precision": 0.0, "context_recall": 0.0, "per_question": []}
+    """Run RAGAS evaluation. Cần LLM judge (OpenAI hoặc Gemini) + Python 3.11+."""
+    zeros = {"faithfulness": 0.0, "answer_relevancy": 0.0,
+             "context_precision": 0.0, "context_recall": 0.0, "per_question": []}
+    try:
+        from ragas import evaluate
+        from ragas.metrics import (faithfulness, answer_relevancy,
+                                    context_precision, context_recall)
+        from datasets import Dataset
+
+        dataset = Dataset.from_dict({
+            "question": questions, "answer": answers,
+            "contexts": contexts, "ground_truth": ground_truths,
+        })
+        metrics = [faithfulness, answer_relevancy, context_precision, context_recall]
+
+        llm, embeddings = _build_ragas_judge()
+        kwargs = {}
+        if llm is not None:
+            kwargs["llm"] = llm
+        if embeddings is not None:
+            kwargs["embeddings"] = embeddings
+
+        # Giảm concurrency + tăng retry để chịu được rate-limit của Gemini free tier.
+        try:
+            from ragas.run_config import RunConfig
+            kwargs["run_config"] = RunConfig(max_workers=4, max_retries=10, timeout=180)
+        except Exception:
+            pass
+
+        result = evaluate(dataset, metrics=metrics, **kwargs)
+
+        df = result.to_pandas()
+
+        def _col(row, *names):
+            """RAGAS đổi tên cột giữa các bản — thử lần lượt."""
+            for n in names:
+                if n in row and row[n] is not None:
+                    try:
+                        v = float(row[n])
+                        return 0.0 if v != v else v   # NaN → 0.0
+                    except (TypeError, ValueError):
+                        continue
+            return 0.0
+
+        per_question = [
+            EvalResult(
+                question=row.get("question", row.get("user_input", "")),
+                answer=row.get("answer", row.get("response", "")),
+                contexts=row.get("contexts", row.get("retrieved_contexts", [])),
+                ground_truth=row.get("ground_truth", row.get("reference", "")),
+                faithfulness=_col(row, "faithfulness"),
+                answer_relevancy=_col(row, "answer_relevancy"),
+                context_precision=_col(row, "context_precision"),
+                context_recall=_col(row, "context_recall"),
+            )
+            for _, row in df.iterrows()
+        ]
+
+        def _avg(attr):
+            vals = [getattr(p, attr) for p in per_question]
+            return round(sum(vals) / len(vals), 4) if vals else 0.0
+
+        return {
+            "faithfulness": _avg("faithfulness"),
+            "answer_relevancy": _avg("answer_relevancy"),
+            "context_precision": _avg("context_precision"),
+            "context_recall": _avg("context_recall"),
+            "per_question": per_question,
+        }
+    except Exception as e:
+        print(f"  ⚠️  RAGAS evaluation failed: {e}")
+        return zeros
 
 
 def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list[dict]:
     """Analyze bottom-N worst questions using Diagnostic Tree."""
-    # TODO: Implement failure analysis
-    # 1. diagnostic_tree = {
-    #        "faithfulness": ("LLM hallucinating", "Tighten prompt, lower temperature"),
-    #        "context_recall": ("Missing relevant chunks", "Improve chunking or add BM25"),
-    #        "context_precision": ("Too many irrelevant chunks", "Add reranking or metadata filter"),
-    #        "answer_relevancy": ("Answer doesn't match question", "Improve prompt template"),
-    #    }
-    # 2. For each EvalResult: compute avg of 4 metrics, find worst_metric
-    # 3. Sort by avg ascending → take bottom_n
-    # 4. Return [{"question": ..., "worst_metric": ..., "score": ...,
-    #             "diagnosis": ..., "suggested_fix": ...}]
-    return []
+    diagnostic_tree = {
+        "faithfulness": ("LLM hallucinating — câu trả lời không bám context",
+                         "Siết prompt 'chỉ dùng context', giảm temperature, thêm câu 'nếu không có thì nói không biết'"),
+        "context_recall": ("Thiếu chunk liên quan trong context",
+                            "Cải thiện chunking (semantic/hierarchical) hoặc tăng trọng số BM25 trong hybrid"),
+        "context_precision": ("Quá nhiều chunk nhiễu, chunk đúng bị xếp thấp",
+                              "Thêm reranking (cross-encoder) hoặc metadata filter, giảm top_k"),
+        "answer_relevancy": ("Câu trả lời lạc đề so với câu hỏi",
+                             "Cải thiện prompt template, yêu cầu trả lời trực tiếp đúng trọng tâm câu hỏi"),
+    }
+
+    rows = []
+    for r in eval_results:
+        metrics = {
+            "faithfulness": r.faithfulness,
+            "answer_relevancy": r.answer_relevancy,
+            "context_precision": r.context_precision,
+            "context_recall": r.context_recall,
+        }
+        avg = sum(metrics.values()) / len(metrics)
+        worst_metric = min(metrics, key=metrics.get)
+        diagnosis, fix = diagnostic_tree[worst_metric]
+        rows.append({
+            "question": r.question,
+            "worst_metric": worst_metric,
+            "worst_score": round(metrics[worst_metric], 4),
+            "avg_score": round(avg, 4),
+            "scores": {k: round(v, 4) for k, v in metrics.items()},
+            "diagnosis": diagnosis,
+            "suggested_fix": fix,
+        })
+
+    rows.sort(key=lambda x: x["avg_score"])   # tệ nhất lên đầu
+    return rows[:bottom_n]
 
 
 def save_report(results: dict, failures: list[dict], path: str = "ragas_report.json"):
